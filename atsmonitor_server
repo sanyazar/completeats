@@ -1,0 +1,394 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use v5.12;
+use AnyEvent::Impl::Perl;
+use AnyEvent;
+use AnyEvent::Handle;
+use AnyEvent::Socket;
+use Asterisk::AMI;
+use Data::Dumper;
+use Encode::Detect::Detector;
+use JSON::XS;
+
+my $json_xs = JSON::XS->new();
+$json_xs->ascii(1);
+#$json_xs->encode($perl_data);
+
+
+#Port to listen on
+my $port = 5080;
+
+#Delimiters
+my $EOL = "\015\012";
+
+my $EOR = $EOL;
+
+#Command list;
+my $list = 'Command List:' . $EOL;
+#$list .= 'channels - Displays list of active channels' . $EOL;
+#$list .= 'mailbox <mailbox> - Displays messages for a mailbox' . $EOL;
+#$list .= 'hangup <channel> - Hangs up a channel' . $EOL;
+#$list .= 'quit - Disconnects from server' . $EOL;
+$list .= 'list - Displays this list' . $EOL . $EOR;
+
+#Set global var to save options
+my $responsebank;
+
+#Keep a list of clients
+my %clients;
+
+#Connect to asterisk
+my $astman = Asterisk::AMI->new(PeerAddr => '127.0.0.1',
+				Username => 'zar',
+				Secret	=> 'PASSWDzar',
+				Timeout => 3, #Default timeout for all operations, 3 seconds
+				on_error => sub { print "Error occured on socket\r\n"; exit; },
+				on_timeout => sub { print "Connection to asterisk timed out\r\n"; exit; },
+                                Blocking => 0,
+				OriginateHack => 1
+			);
+
+die "Unable to connect to asterisk" unless ($astman);
+
+use Asterisk::AMI::Common;
+my $astman_cm = Asterisk::AMI::Common->new(PeerAddr => '127.0.0.1',
+                                           PeerPort => '5038',
+                                           Username => 'zar',
+                                           Secret  =>  'PASSWDzar'
+                           );
+die "Unable to connect to asterisk" unless ($astman_cm);
+
+#Callback on mailbox command
+sub mailboxcb {
+	my ($asterisk, $action, $client) = @_;
+
+	my $id = $action->{'ActionID'};
+	
+	my $mbstr;
+
+	if ($action->{'GOOD'} && exists $action->{'PARSED'}) {
+		while (my ($key, $value) = each %{$action->{'PARSED'}}) {
+			$mbstr .= $key . ': '. $value . $EOL;
+		}
+	} else {
+		$mbstr = 'Invalid Mailbox, or command failed' . $EOL;
+	}
+
+	$client->push_write($mbstr . $EOR);
+}
+
+#Callback on json command
+sub jsonfullcb {
+	my ($asterisk, $action, $client) = @_;
+
+	$json_xs->pretty(1);
+	$client->push_write( $json_xs->encode($action) . $EOL . $EOR);
+}
+
+#Callback on sep options
+sub optset {
+	my ($client, $option, $value) = @_;
+        use DBI;
+        # имя базы данных
+        my $dbname = "asterisk";
+        # имя пользователя
+        my $username = "asterisk";
+        # пароль
+        #my $password = "AstraKonESTIk98";
+        my $password = "asteposter54gy";
+        # имя или IP адрес сервера
+        my $dbhost = "localhost";
+        # порт
+        my $dbport = "5432";
+        # опции
+        my $dboptions = "-e";
+        # терминал
+        my $dbtty = "ansi";
+
+        my $opttablename = 'atsoptions';
+
+        my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$dbhost;port=$dbport;options=$dboptions;tty=$dbtty","$username","$password",
+                            {PrintError => 0});
+
+	if ($option eq 'fulltimework') {
+		if ($value eq 'YES') {
+			my $query = "UPDATE atsoptions SET optval = 'YES' WHERE optname = 'WORKFULLTIME'";
+        		$dbh->do($query);
+		} elsif ($value eq 'NO') {
+			my $query = "UPDATE atsoptions SET optval = 'NO' WHERE optname = 'WORKFULLTIME'";
+        		$dbh->do($query);
+		}
+	} elsif ($option eq 'robotwork') {
+		if ($value eq 'YES') {
+			my $query = "UPDATE atsoptions SET optval = 'YES' WHERE optname = 'WORKROBOT'";
+        		$dbh->do($query);
+		} elsif ($value eq 'NO') {
+			my $query = "UPDATE atsoptions SET optval = 'NO' WHERE optname = 'WORKROBOT'";
+        		$dbh->do($query);
+		}
+	}
+}
+
+#Callback on json command
+sub jsonfullcm {
+	#$astman_cm->queues
+	#my ($asterisk, $action, $client) = @_;
+	my ($client, $pretty) = @_;
+
+	$json_xs->pretty($pretty);
+	#$client->push_write( $json_xs->encode($astman_cm->queues()) . $EOL . $EOR);
+	$client->push_write( $json_xs->encode($responsebank) . $EOL . $EOR);
+}
+
+#Get options from database
+sub getdboptions {
+        use DBI;
+        # имя базы данных
+        my $dbname = "asterisk";
+        # имя пользователя
+        my $username = "asterisk";
+        # пароль
+        #my $password = "AstraKonESTIk98";
+        my $password = "asteposter54gy";
+        # имя или IP адрес сервера
+        my $dbhost = "localhost";
+        # порт
+        my $dbport = "5432";
+        # опции
+        my $dboptions = "-e";
+        # терминал
+        my $dbtty = "ansi";
+
+        my $opttablename = 'atsoptions';
+
+        my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$dbhost;port=$dbport;options=$dboptions;tty=$dbtty","$username","$password",
+                            {PrintError => 0});
+
+	my $query = "SELECT optname, optval from atsoptions";
+
+	my $optstruct;
+	my $count;
+
+        my $sth = $dbh->prepare($query);
+        my $optrv;
+	my $optkey;
+	my $optval;
+        $optrv = $sth->execute();
+        if (defined $optrv) {
+		$count = 0;
+		while (($optkey, $optval) = $sth->fetchrow_array()) {
+        		$optstruct->{$optkey} = $optval;
+		}
+        }
+	return $optstruct;
+
+}
+
+#Callback on json command
+sub jsoncb {
+
+        use DBI;
+        # имя базы данных
+        my $dbname = "asterisk";
+        # имя пользователя
+        my $username = "asterisk";
+        # пароль
+        #my $password = "AstraKonESTIk98";
+        my $password = "asteposter54gy";
+        # имя или IP адрес сервера
+        my $dbhost = "localhost";
+        # порт
+        my $dbport = "5432";
+        # опции
+        my $dboptions = "-e";
+        # терминал
+        my $dbtty = "ansi";
+
+        my $opttablename = 'atsoptions';
+
+        my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$dbhost;port=$dbport;options=$dboptions;tty=$dbtty","$username","$password",
+                            {PrintError => 0});
+
+	my $query = "SELECT optname, optval from atsoptions";
+
+	my ($asterisk, $action, $client) = @_;
+
+	my $id = $action->{'ActionID'};
+	
+	my @chanarr;
+	my $chanstr;
+	my $chanstruct;
+	my $actionstruct;
+	my $chancount;
+
+        my $sth = $dbh->prepare($query);
+        my $optrv;
+        my @optarray;
+	my $optkey;
+	my $optval;
+        $optrv = $sth->execute();
+        if (defined $optrv) {
+		$chancount = 0;
+		while (($optkey, $optval) = $sth->fetchrow_array()) {
+        		$actionstruct->{'OPTIONS'}->{$optkey} = $optval;
+		}
+		#$actionstruct->{'OPTIONS'} = \@optarray;
+        }
+
+	if ($action->{'GOOD'} && exists $action->{'EVENTS'}) {
+		$chancount = 0;
+		foreach my $channel (@{$action->{'EVENTS'}}) {
+			#push(@chanarr, $channel->{'Channel'});
+			$chanarr[$chancount]->{'Channel'} = $channel->{'Channel'};
+			if (exists $channel->{'BridgeID'}) {
+				$chanarr[$chancount]->{'BridgeID'} = $channel->{'BridgeID'};
+			}
+			$chancount++;
+			#push(@chanarr, $chanstruct);
+		}
+		$actionstruct->{'CHANNELS'} = \@chanarr;
+	} else {
+		$actionstruct->{'ERROR'} = 'No channels active';
+	}
+
+	#$client->push_write( $json_xs->encode($chanstruct) . $EOL . $EOR);
+	#$json_xs->pretty(1);
+	#$client->push_write( $json_xs->encode($action) . $EOL . $EOR);
+	$client->push_write( $json_xs->encode($actionstruct) . $EOL . $EOR);
+}
+
+#Callback on channels command
+sub chancb {
+	my ($asterisk, $action, $client) = @_;
+
+	my $id = $action->{'ActionID'};
+	
+	my @chanarr;
+	my $chanstr;
+	my $chanstruct;
+
+	if ($action->{'GOOD'} && exists $action->{'EVENTS'}) {
+		foreach my $channel (@{$action->{'EVENTS'}}) {
+			$chanstr .= $channel->{'Channel'} . $EOL;
+		}
+	} else {
+		$chanstr = 'No channels active' . $EOL;
+	}
+
+	$client->push_write($chanstr . $EOR);
+}
+
+#Callback on hangup command
+sub hangupcb {
+	my ($asterisk, $action, $client) = @_;
+
+	my $id = $action->{'ActionID'};
+
+	my $str;
+
+	if ($action->{'GOOD'}) {
+		$str = 'Channel hungup';
+	} else {
+		$str = 'Failed to hangup channel';
+	}	
+
+	$client->push_write($str . $EOL . $EOR);
+}
+
+#Remove a client if they d/c or error
+sub remove_client {
+        delete $clients{$_[0]};
+	$_[0]->destroy;
+	return 1;
+}
+
+#Handle commands from clients
+sub client_input {
+	my ($handle) = @_;
+
+	my @cmd = split /\s+/,$handle->{rbuf};		
+	undef $handle->{rbuf};
+
+	return unless ($cmd[0]);
+
+	if ($cmd[0] eq 'mailbox') {
+		$astman->send_action({	Action => 'MailboxCount',
+				  	Mailbox => $cmd[1] . '@default' }, \&mailboxcb, undef, $handle);
+	} elsif ($cmd[0] eq 'optset') {
+		&optset($handle, $cmd[1], $cmd[2]);
+	} elsif ($cmd[0] eq 'jsonfull') {
+		$astman->send_action({Action => 'Status'}, \&jsonfullcb, undef, $handle);
+	} elsif ($cmd[0] eq 'jsonopt') {
+		&jsonfullcm($handle, 0);
+	} elsif ($cmd[0] eq 'jsonoptp') {
+		&jsonfullcm($handle, 1);
+	} elsif ($cmd[0] eq 'json') {
+		$astman->send_action({Action => 'Status'}, \&jsoncb, undef, $handle);
+	} elsif ($cmd[0] eq 'channels') {
+		$astman->send_action({Action => 'Status'}, \&chancb, undef, $handle);
+	} elsif ($cmd[0] eq 'hangup') {
+		$astman->send_action({	Action => 'Hangup',
+					Channel => $cmd[1] }, \&hangupcb, undef, $handle);
+	} elsif ($cmd[0] eq 'list') {
+		$handle->push_write($list);
+	} elsif ($cmd[0] eq 'quit') {
+		$handle->push_write('Goodbye' . $EOL . $EOR);
+		remove_client($handle);
+	} else {
+		$handle->push_write('Invalid Command' . $EOL . $EOR);
+	}
+	
+	return 1;
+}
+
+#Handles new connections
+sub new_client {
+	my ($fh, $host, $port) = @_;
+
+	#Create an AnyEvent handler for the client
+	my $handle = new AnyEvent::Handle(	fh => $fh,
+						on_error => \&remove_client,
+						on_eof => \&remove_client
+						);
+
+	#Read what to do on client input
+	$handle->on_read(\&client_input);
+
+	#Send a greeting
+	$handle->push_write('Connected to command server.' . $EOL);
+	$handle->push_write('Enter \'list\' for a list of commands' . $EOL . $EOR);
+
+        $clients{$handle} = $handle;
+}
+
+
+
+#Our server to accept connections
+my $tcpserver = tcp_server undef, $port, \&new_client;
+
+#OnTimer Event in our server
+my $alive_timer = AnyEvent->timer(
+    after    => 0,
+    interval => 5,
+    cb       => sub {
+        $responsebank->{QUEUES} = $astman_cm->queues();
+	undef $responsebank->{QUEUES}->{p2p_cm};
+	undef $responsebank->{QUEUES}->{itqueue};
+	$responsebank->{CHANNELS} = $astman_cm->channels();
+	$responsebank->{PEERS} = $astman_cm->sip_peers();
+	$responsebank->{OPTIONS} = &getdboptions();
+	#$responsebank->{CHANNELS_CODE} = 
+	#say Encode::Detect::Detector::detect($astman_cm->channels());
+	#$responsebank->{PEERS_CODE} = 
+	#say Dumper($astman_cm->sip_peers());
+	#say Dumper($astman_cm->queues());
+        #say "Server alive ".$responsebank->{PEERS_CODE};
+    }
+);
+
+#Start our server
+print "Starting Command Server\r\n";
+AnyEvent::Impl::Perl::loop;
+
